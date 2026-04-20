@@ -1,86 +1,24 @@
+// ─────────────────────────────────────────────────────────────
+//  scraper.js  —  Multi-store price scraper
+//
+//  Run: node src/scraper.js
+//
+//  - Reads all stores + categories from urls.js
+//  - Each store/category gets its own output folder
+//  - Fully resumable: if crashed, re-run and it continues
+//  - Each store uses its own parser (different HTML = different selectors)
+//  - Browser auto-reconnects on disconnect
+// ─────────────────────────────────────────────────────────────
+
 require('dotenv').config();
 const { chromium } = require('playwright');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
-const { CATEGORY_URLS } = require('./urls');
-const { parseProductLinks, getNextPageUrl, parseProductDetails } = require('./parser');
+const { STORES } = require('./urls');
 
 const AUTH = process.env.BRIGHT_DATA_AUTH;
 
-// ── Output setup ──────────────────────────────────────────────
-const RUN_ID = Date.now();
-const OUTPUT_DIR = path.join('output', `run_${RUN_ID}`);
-const FULL_OUTPUT   = path.join(OUTPUT_DIR, 'products_full.json');
-const PRICE_OUTPUT  = path.join(OUTPUT_DIR, 'products_prices.json');
-
-// ── IMPORTANT: Point these at your EXISTING run folder so it resumes ──
-// Change this to your actual folder name, e.g. "run_1776343255891"
-// If you want a fresh start, set RESUME_FROM_RUN = null
-const RESUME_FROM_RUN = 'run_1776343255891'; // ← UPDATE THIS to your folder name
-
-const URLS_CACHE    = RESUME_FROM_RUN
-  ? path.join('output', RESUME_FROM_RUN, 'collected_urls.json')
-  : path.join(OUTPUT_DIR, 'collected_urls.json');
-
-const VISITED_CACHE = path.join(OUTPUT_DIR, 'visited.json');
-
-// ─────────────────────────────────────────────────────────────
-
-function ensureOutputDir() {
-  if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-}
-
-function saveProduct(product) {
-  let existing = [];
-  if (fs.existsSync(FULL_OUTPUT)) {
-    try { existing = JSON.parse(fs.readFileSync(FULL_OUTPUT, 'utf8')); } catch (_) {}
-  }
-  existing.push(product);
-  fs.writeFileSync(FULL_OUTPUT, JSON.stringify(existing, null, 2));
-}
-
-function rebuildPriceFile() {
-  if (!fs.existsSync(FULL_OUTPUT)) return;
-  try {
-    const all = JSON.parse(fs.readFileSync(FULL_OUTPUT, 'utf8'));
-    const prices = all.map(p => ({
-      sku:           p.sku,
-      name:          p.name,
-      category:      p.category,
-      salePrice:     p.salePrice,
-      originalPrice: p.originalPrice,
-      stockStatus:   p.stockStatus,
-      discountBadge: p.discountBadge,
-      tags:          p.tags,
-      url:           p.url,
-      scrapedAt:     p.scrapedAt,
-    }));
-    fs.writeFileSync(PRICE_OUTPUT, JSON.stringify(prices, null, 2));
-  } catch (_) {}
-}
-
-function saveVisited(visited) {
-  fs.writeFileSync(VISITED_CACHE, JSON.stringify([...visited], null, 2));
-}
-
-function loadVisited() {
-  if (!fs.existsSync(VISITED_CACHE)) return new Set();
-  try { return new Set(JSON.parse(fs.readFileSync(VISITED_CACHE, 'utf8'))); } catch (_) { return new Set(); }
-}
-
-function saveCollectedUrls(urls) {
-  fs.writeFileSync(URLS_CACHE, JSON.stringify([...urls], null, 2));
-}
-
-function loadCollectedUrls() {
-  if (!fs.existsSync(URLS_CACHE)) return null;
-  try { return new Set(JSON.parse(fs.readFileSync(URLS_CACHE, 'utf8'))); } catch (_) { return null; }
-}
-
-// ── Browser management ────────────────────────────────────────
-// A simple wrapper that always gives you a live browser,
-// reconnecting automatically whenever it drops.
-
+// ── Browser state ─────────────────────────────────────────────
 let _browser = null;
 
 async function connectBrowser(retries = 5) {
@@ -91,10 +29,9 @@ async function connectBrowser(retries = 5) {
         `wss://${AUTH}@brd.superproxy.io:9222`,
         { timeout: 60_000 }
       );
-      console.log('✅ Connected');
-      // Auto-reconnect when the browser closes unexpectedly
+      console.log('✅ Connected\n');
       browser.on('disconnected', () => {
-        console.log('⚡ Browser disconnected — will reconnect on next request');
+        console.log('\n⚡ Browser disconnected — will reconnect on next request');
         _browser = null;
       });
       return browser;
@@ -112,9 +49,7 @@ async function connectBrowser(retries = 5) {
 }
 
 async function getBrowser() {
-  if (!_browser) {
-    _browser = await connectBrowser();
-  }
+  if (!_browser) _browser = await connectBrowser();
   return _browser;
 }
 
@@ -125,58 +60,87 @@ async function navigateSafe(page, url) {
   try {
     const client = await page.context().newCDPSession(page);
     const { status } = await client.send('Captcha.waitForSolve', { detectTimeout: 15_000 });
-    if (status !== 'not_detected') console.log(`  🔓 Captcha solved: ${status}`);
+    if (status !== 'not_detected') console.log(`  🔓 Captcha: ${status}`);
   } catch (_) {}
   await page.waitForSelector('body', { timeout: 30_000 });
   await page.waitForTimeout(2000);
 }
 
-// ── Scrape a single product with retry + auto-reconnect ───────
+// ── File helpers ──────────────────────────────────────────────
 
-async function scrapeProduct(productUrl) {
-  const MAX_ATTEMPTS = 3;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    let page = null;
-    try {
-      const browser = await getBrowser();  // reconnects if needed
-      page = await browser.newPage();
-      await navigateSafe(page, productUrl);
-      const product = await parseProductDetails(page, productUrl);
-      await page.close();
-      return product;
-
-    } catch (err) {
-      // Close the page if it's still open
-      if (page) {
-        try { await page.close(); } catch (_) {}
-      }
-
-      const isBrowserDead =
-        err.message.includes('closed') ||
-        err.message.includes('disconnected') ||
-        err.message.includes('Target page');
-
-      if (isBrowserDead) {
-        console.log(`  ⚠️  Attempt ${attempt}: browser died — reconnecting...`);
-        _browser = null; // force reconnect on next getBrowser() call
-      } else {
-        console.error(`  ⚠️  Attempt ${attempt} failed: ${err.message}`);
-      }
-
-      if (attempt < MAX_ATTEMPTS) {
-        await new Promise(r => setTimeout(r, 4000 * attempt));
-      }
-    }
-  }
-
-  console.error(`  ❌ Giving up on: ${productUrl}`);
-  return null; // ← never throws, just returns null so the loop continues
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-// ── Category link collection ──────────────────────────────────
+function readJson(filePath, fallback) {
+  if (!fs.existsSync(filePath)) return fallback;
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (_) { return fallback; }
+}
 
-async function collectProductUrlsFromCategory(startUrl) {
+function writeJson(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+// ── Per store+category output paths ──────────────────────────
+// output/
+//   primeabgb/
+//     cpu-processor/
+//       collected_urls.json   ← all product URLs found
+//       visited.json          ← which ones we've scraped
+//       products_full.json    ← all fields
+//       products_prices.json  ← price-only summary
+//     motherboards/
+//       ...
+//   mdcomputers/
+//     cpu-processor/
+//       ...
+
+function getPaths(storeName, categorySlug) {
+  const dir = path.join('output', storeName, categorySlug);
+  return {
+    dir,
+    urlsCache:     path.join(dir, 'collected_urls.json'),
+    visitedCache:  path.join(dir, 'visited.json'),
+    fullOutput:    path.join(dir, 'products_full.json'),
+    priceOutput:   path.join(dir, 'products_prices.json'),
+  };
+}
+
+// ── Save helpers ──────────────────────────────────────────────
+
+function appendProduct(fullOutputPath, product) {
+  const existing = readJson(fullOutputPath, []);
+  existing.push(product);
+  writeJson(fullOutputPath, existing);
+}
+
+function rebuildPriceFile(fullOutputPath, priceOutputPath) {
+  const all = readJson(fullOutputPath, []);
+  const prices = all.map(p => ({
+    store:         p.store,
+    sku:           p.sku,
+    name:          p.name,
+    category:      p.category,
+    salePrice:     p.salePrice,
+    originalPrice: p.originalPrice,
+    stockStatus:   p.stockStatus,
+    discountBadge: p.discountBadge,
+    tags:          p.tags,
+    url:           p.url,
+    scrapedAt:     p.scrapedAt,
+  }));
+  writeJson(priceOutputPath, prices);
+}
+
+// ── Core scraping logic ───────────────────────────────────────
+
+async function collectUrlsForCategory(parser, startUrl, urlsCachePath) {
+  const saved = readJson(urlsCachePath, null);
+  if (saved) {
+    console.log(`  ♻️  Loaded ${saved.length} cached URLs`);
+    return new Set(saved);
+  }
+
   const productUrls = new Set();
   let currentUrl = startUrl;
   let pageNum = 1;
@@ -188,24 +152,98 @@ async function collectProductUrlsFromCategory(startUrl) {
       const browser = await getBrowser();
       page = await browser.newPage();
       await navigateSafe(page, currentUrl);
-      const links = await parseProductLinks(page);
-      console.log(`     Found ${links.length} product links`);
+      const links = await parser.parseProductLinks(page);
+      console.log(`     ↳ ${links.length} links`);
       links.forEach(l => productUrls.add(l));
-      currentUrl = await getNextPageUrl(page);
+      currentUrl = await parser.getNextPageUrl(page);
       pageNum++;
     } catch (err) {
-      console.error(`  ❌ Error on listing page: ${err.message}`);
-      if (err.message.includes('closed') || err.message.includes('disconnected')) {
-        _browser = null;
-      }
+      console.error(`  ❌ Listing page error: ${err.message}`);
+      if (err.message.includes('closed') || err.message.includes('disconnected')) _browser = null;
       currentUrl = null;
     } finally {
-      if (page) { try { await page.close(); } catch (_) {} }
+      if (page) try { await page.close(); } catch (_) {}
     }
     await new Promise(r => setTimeout(r, 1500));
   }
 
+  writeJson(urlsCachePath, [...productUrls]);
   return productUrls;
+}
+
+async function scrapeProductSafe(parser, productUrl) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let page = null;
+    try {
+      const browser = await getBrowser();
+      page = await browser.newPage();
+      await navigateSafe(page, productUrl);
+      const product = await parser.parseProductDetails(page, productUrl);
+      await page.close();
+      return product;
+    } catch (err) {
+      if (page) try { await page.close(); } catch (_) {}
+      const dead = err.message.includes('closed') ||
+                   err.message.includes('disconnected') ||
+                   err.message.includes('Target page');
+      if (dead) { _browser = null; console.log(`  ⚠️  Attempt ${attempt}: browser died`); }
+      else console.error(`  ⚠️  Attempt ${attempt}: ${err.message}`);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 4000 * attempt));
+    }
+  }
+  return null; // never throws — main loop always continues
+}
+
+async function scrapeCategory(store, category) {
+  const { name: storeName, parser } = store;
+  const { slug, url: startUrl } = category;
+
+  console.log(`\n${'─'.repeat(60)}`);
+  console.log(`🏪 Store: ${storeName}  📂 Category: ${slug}`);
+  console.log(`${'─'.repeat(60)}`);
+
+  const paths = getPaths(storeName, slug);
+  ensureDir(paths.dir);
+
+  // Phase 1: Collect URLs
+  const productUrls = await collectUrlsForCategory(parser, startUrl, paths.urlsCache);
+  console.log(`  ✅ ${productUrls.size} product URLs total`);
+
+  // Phase 2: Scrape each product
+  const visited = new Set(readJson(paths.visitedCache, []));
+  const total   = productUrls.size;
+  let done      = visited.size;
+
+  if (visited.size > 0) {
+    console.log(`  ♻️  Resuming: ${visited.size} done, ${total - visited.size} remaining`);
+  }
+
+  for (const productUrl of productUrls) {
+    if (visited.has(productUrl)) continue;
+    done++;
+
+    process.stdout.write(`  🛒 [${done}/${total}] `);
+
+    const product = await scrapeProductSafe(parser, productUrl);
+
+    if (product?.name) {
+      appendProduct(paths.fullOutput, product);
+      rebuildPriceFile(paths.fullOutput, paths.priceOutput);
+      console.log(`✅ ${product.name.substring(0, 60)}`);
+      console.log(`     SKU: ${product.sku || 'N/A'} | ${product.salePrice || 'N/A'} | ${product.stockStatus || 'N/A'}`);
+    } else {
+      console.log(`⚠️  No data — ${productUrl}`);
+    }
+
+    visited.add(productUrl);
+    writeJson(paths.visitedCache, [...visited]);
+
+    await new Promise(r => setTimeout(r, 1500));
+  }
+
+  console.log(`\n  🏁 ${storeName}/${slug} complete: ${done} products scraped`);
+  console.log(`     Full  → ${paths.fullOutput}`);
+  console.log(`     Price → ${paths.priceOutput}`);
 }
 
 // ── Main ──────────────────────────────────────────────────────
@@ -215,81 +253,47 @@ async function scrape() {
     throw new Error('Set BRIGHT_DATA_AUTH in your .env file');
   }
 
-  ensureOutputDir();
-  console.log(`📁 Output folder: ${OUTPUT_DIR}\n`);
+  console.log('🚀 Multi-store price scraper starting...\n');
+  console.log(`Stores configured: ${STORES.map(s => s.name).join(', ')}`);
 
-  // Initial connection
+  const totalCategories = STORES.reduce((acc, s) => acc + s.categories.length, 0);
+  console.log(`Total categories: ${totalCategories}\n`);
+
   await getBrowser();
 
-  // ── Phase 1: Collect all product URLs ──────────────────────
-  let productUrls = loadCollectedUrls();
-
-  if (productUrls) {
-    console.log(`♻️  Resuming from cached URLs (${productUrls.size} URLs)\n`);
-  } else {
-    productUrls = new Set();
-    for (const categoryUrl of CATEGORY_URLS) {
-      console.log(`\n📂 Category: ${categoryUrl}`);
+  for (const store of STORES) {
+    for (const category of store.categories) {
       try {
-        const urls = await collectProductUrlsFromCategory(categoryUrl);
-        console.log(`   ✅ ${urls.size} products found`);
-        urls.forEach(u => productUrls.add(u));
-        saveCollectedUrls(productUrls);
+        await scrapeCategory(store, category);
       } catch (err) {
-        console.error(`  ❌ Category failed: ${err.message}`);
+        console.error(`\n❌ Failed: ${store.name}/${category.slug}: ${err.message}`);
+        // Continue to next category even if this one fails
       }
     }
-    console.log(`\n✅ Total unique product URLs: ${productUrls.size}`);
-    saveCollectedUrls(productUrls);
   }
 
-  // ── Phase 2: Scrape each product page ──────────────────────
-  const visited = loadVisited();
-  const total = productUrls.size;
-  let doneCount = visited.size;
+  if (_browser) try { await _browser.close(); } catch (_) {}
 
-  if (visited.size > 0) {
-    console.log(`♻️  Resuming — ${visited.size} already scraped, ${total - visited.size} remaining\n`);
-  }
-
-  for (const productUrl of productUrls) {
-    if (visited.has(productUrl)) continue;
-    doneCount++;
-
-    console.log(`\n🛒 [${doneCount}/${total}] ${productUrl}`);
-
-    // scrapeProduct() NEVER throws — it returns null on total failure
-    const product = await scrapeProduct(productUrl);
-
-    if (product?.name) {
-      saveProduct(product);
-      rebuildPriceFile();
-      console.log(`  ✅ ${product.name}`);
-      console.log(`     SKU: ${product.sku} | Price: ${product.salePrice} | Stock: ${product.stockStatus}`);
-    } else {
-      console.log(`  ⚠️  Skipped (no product name found)`);
-    }
-
-    // Always mark as visited so we don't retry failed ones endlessly
-    visited.add(productUrl);
-    saveVisited(visited);
-
-    await new Promise(r => setTimeout(r, 1500));
-  }
-
-  if (_browser) {
-    try { await _browser.close(); } catch (_) {}
-  }
-
-  console.log(`\n🎉 Done!`);
-  console.log(`   Full data  → ${FULL_OUTPUT}`);
-  console.log(`   Price data → ${PRICE_OUTPUT}`);
+  console.log('\n\n🎉 All stores and categories complete!');
+  console.log('Output saved in: output/<store>/<category>/');
 }
 
 scrape().catch(err => {
   console.error('Fatal error:', err.message);
   process.exit(1);
 });
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -310,8 +314,19 @@ scrape().catch(err => {
 // const OUTPUT_DIR = path.join('output', `run_${RUN_ID}`);
 // const FULL_OUTPUT   = path.join(OUTPUT_DIR, 'products_full.json');
 // const PRICE_OUTPUT  = path.join(OUTPUT_DIR, 'products_prices.json');
-// const URLS_CACHE    = path.join(OUTPUT_DIR, 'collected_urls.json');
+
+// // ── IMPORTANT: Point these at your EXISTING run folder so it resumes ──
+// // Change this to your actual folder name, e.g. "run_1776343255891"
+// // If you want a fresh start, set RESUME_FROM_RUN = null
+// const RESUME_FROM_RUN = 'run_1776343255891'; // ← UPDATE THIS to your folder name
+
+// const URLS_CACHE    = RESUME_FROM_RUN
+//   ? path.join('output', RESUME_FROM_RUN, 'collected_urls.json')
+//   : path.join(OUTPUT_DIR, 'collected_urls.json');
+
 // const VISITED_CACHE = path.join(OUTPUT_DIR, 'visited.json');
+
+// // ─────────────────────────────────────────────────────────────
 
 // function ensureOutputDir() {
 //   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -364,7 +379,13 @@ scrape().catch(err => {
 //   try { return new Set(JSON.parse(fs.readFileSync(URLS_CACHE, 'utf8'))); } catch (_) { return null; }
 // }
 
-// async function connectBrowser(retries = 3) {
+// // ── Browser management ────────────────────────────────────────
+// // A simple wrapper that always gives you a live browser,
+// // reconnecting automatically whenever it drops.
+
+// let _browser = null;
+
+// async function connectBrowser(retries = 5) {
 //   for (let i = 1; i <= retries; i++) {
 //     try {
 //       console.log(`🔌 Connecting to Bright Data... (attempt ${i})`);
@@ -373,14 +394,33 @@ scrape().catch(err => {
 //         { timeout: 60_000 }
 //       );
 //       console.log('✅ Connected');
+//       // Auto-reconnect when the browser closes unexpectedly
+//       browser.on('disconnected', () => {
+//         console.log('⚡ Browser disconnected — will reconnect on next request');
+//         _browser = null;
+//       });
 //       return browser;
 //     } catch (err) {
 //       console.error(`  ❌ Connection failed: ${err.message}`);
-//       if (i < retries) await new Promise(r => setTimeout(r, 5000));
-//       else throw err;
+//       if (i < retries) {
+//         const wait = i * 3000;
+//         console.log(`  ⏳ Retrying in ${wait / 1000}s...`);
+//         await new Promise(r => setTimeout(r, wait));
+//       } else {
+//         throw new Error(`Could not connect after ${retries} attempts`);
+//       }
 //     }
 //   }
 // }
+
+// async function getBrowser() {
+//   if (!_browser) {
+//     _browser = await connectBrowser();
+//   }
+//   return _browser;
+// }
+
+// // ── Navigation ────────────────────────────────────────────────
 
 // async function navigateSafe(page, url) {
 //   await page.goto(url, { timeout: 2 * 60 * 1000, waitUntil: 'domcontentloaded' });
@@ -393,15 +433,62 @@ scrape().catch(err => {
 //   await page.waitForTimeout(2000);
 // }
 
-// async function collectProductUrlsFromCategory(browser, startUrl) {
+// // ── Scrape a single product with retry + auto-reconnect ───────
+
+// async function scrapeProduct(productUrl) {
+//   const MAX_ATTEMPTS = 3;
+
+//   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+//     let page = null;
+//     try {
+//       const browser = await getBrowser();  // reconnects if needed
+//       page = await browser.newPage();
+//       await navigateSafe(page, productUrl);
+//       const product = await parseProductDetails(page, productUrl);
+//       await page.close();
+//       return product;
+
+//     } catch (err) {
+//       // Close the page if it's still open
+//       if (page) {
+//         try { await page.close(); } catch (_) {}
+//       }
+
+//       const isBrowserDead =
+//         err.message.includes('closed') ||
+//         err.message.includes('disconnected') ||
+//         err.message.includes('Target page');
+
+//       if (isBrowserDead) {
+//         console.log(`  ⚠️  Attempt ${attempt}: browser died — reconnecting...`);
+//         _browser = null; // force reconnect on next getBrowser() call
+//       } else {
+//         console.error(`  ⚠️  Attempt ${attempt} failed: ${err.message}`);
+//       }
+
+//       if (attempt < MAX_ATTEMPTS) {
+//         await new Promise(r => setTimeout(r, 4000 * attempt));
+//       }
+//     }
+//   }
+
+//   console.error(`  ❌ Giving up on: ${productUrl}`);
+//   return null; // ← never throws, just returns null so the loop continues
+// }
+
+// // ── Category link collection ──────────────────────────────────
+
+// async function collectProductUrlsFromCategory(startUrl) {
 //   const productUrls = new Set();
 //   let currentUrl = startUrl;
 //   let pageNum = 1;
 
 //   while (currentUrl) {
 //     console.log(`  📄 Page ${pageNum}: ${currentUrl}`);
-//     const page = await browser.newPage();
+//     let page = null;
 //     try {
+//       const browser = await getBrowser();
+//       page = await browser.newPage();
 //       await navigateSafe(page, currentUrl);
 //       const links = await parseProductLinks(page);
 //       console.log(`     Found ${links.length} product links`);
@@ -410,9 +497,12 @@ scrape().catch(err => {
 //       pageNum++;
 //     } catch (err) {
 //       console.error(`  ❌ Error on listing page: ${err.message}`);
+//       if (err.message.includes('closed') || err.message.includes('disconnected')) {
+//         _browser = null;
+//       }
 //       currentUrl = null;
 //     } finally {
-//       await page.close();
+//       if (page) { try { await page.close(); } catch (_) {} }
 //     }
 //     await new Promise(r => setTimeout(r, 1500));
 //   }
@@ -420,27 +510,7 @@ scrape().catch(err => {
 //   return productUrls;
 // }
 
-// async function scrapeProduct(getBrowser, productUrl) {
-//   for (let attempt = 1; attempt <= 3; attempt++) {
-//     const browser = await getBrowser();
-//     const page = await browser.newPage();
-//     try {
-//       await navigateSafe(page, productUrl);
-//       const product = await parseProductDetails(page, productUrl);
-//       await page.close();
-//       return product;
-//     } catch (err) {
-//       await page.close().catch(() => {});
-//       console.error(`  ⚠️  Attempt ${attempt} failed: ${err.message}`);
-//       if (err.message.includes('closed') || err.message.includes('disconnected')) {
-//         console.log('  🔄 Browser closed — reconnecting...');
-//         await getBrowser(true);
-//       }
-//       if (attempt < 3) await new Promise(r => setTimeout(r, 3000));
-//     }
-//   }
-//   return null;
-// }
+// // ── Main ──────────────────────────────────────────────────────
 
 // async function scrape() {
 //   if (!AUTH || AUTH.includes('your_username')) {
@@ -450,15 +520,7 @@ scrape().catch(err => {
 //   ensureOutputDir();
 //   console.log(`📁 Output folder: ${OUTPUT_DIR}\n`);
 
-//   let _browser = null;
-//   async function getBrowser(forceNew = false) {
-//     if (forceNew || !_browser) {
-//       if (_browser) { try { await _browser.close(); } catch (_) {} }
-//       _browser = await connectBrowser();
-//     }
-//     return _browser;
-//   }
-
+//   // Initial connection
 //   await getBrowser();
 
 //   // ── Phase 1: Collect all product URLs ──────────────────────
@@ -471,10 +533,10 @@ scrape().catch(err => {
 //     for (const categoryUrl of CATEGORY_URLS) {
 //       console.log(`\n📂 Category: ${categoryUrl}`);
 //       try {
-//         const urls = await collectProductUrlsFromCategory(await getBrowser(), categoryUrl);
+//         const urls = await collectProductUrlsFromCategory(categoryUrl);
 //         console.log(`   ✅ ${urls.size} products found`);
 //         urls.forEach(u => productUrls.add(u));
-//         saveCollectedUrls(productUrls); // save after each category
+//         saveCollectedUrls(productUrls);
 //       } catch (err) {
 //         console.error(`  ❌ Category failed: ${err.message}`);
 //       }
@@ -485,39 +547,43 @@ scrape().catch(err => {
 
 //   // ── Phase 2: Scrape each product page ──────────────────────
 //   const visited = loadVisited();
-//   if (visited.size > 0) {
-//     console.log(`♻️  Resuming — skipping ${visited.size} already scraped\n`);
-//   }
-
-//   let count = 0;
 //   const total = productUrls.size;
+//   let doneCount = visited.size;
+
+//   if (visited.size > 0) {
+//     console.log(`♻️  Resuming — ${visited.size} already scraped, ${total - visited.size} remaining\n`);
+//   }
 
 //   for (const productUrl of productUrls) {
 //     if (visited.has(productUrl)) continue;
-//     count++;
+//     doneCount++;
 
-//     console.log(`\n🛒 [${count + visited.size}/${total}] ${productUrl}`);
+//     console.log(`\n🛒 [${doneCount}/${total}] ${productUrl}`);
 
-//     const product = await scrapeProduct(getBrowser, productUrl);
+//     // scrapeProduct() NEVER throws — it returns null on total failure
+//     const product = await scrapeProduct(productUrl);
 
 //     if (product?.name) {
 //       saveProduct(product);
 //       rebuildPriceFile();
-//       visited.add(productUrl);
-//       saveVisited(visited);
-//       console.log(`  ✅ ${product.name} | SKU: ${product.sku} | Price: ${product.salePrice} | Stock: ${product.stockStatus}`);
+//       console.log(`  ✅ ${product.name}`);
+//       console.log(`     SKU: ${product.sku} | Price: ${product.salePrice} | Stock: ${product.stockStatus}`);
 //     } else {
-//       console.log(`  ⚠️  Skipped (no product name)`);
-//       visited.add(productUrl);
-//       saveVisited(visited);
+//       console.log(`  ⚠️  Skipped (no product name found)`);
 //     }
+
+//     // Always mark as visited so we don't retry failed ones endlessly
+//     visited.add(productUrl);
+//     saveVisited(visited);
 
 //     await new Promise(r => setTimeout(r, 1500));
 //   }
 
-//   if (_browser) await _browser.close();
+//   if (_browser) {
+//     try { await _browser.close(); } catch (_) {}
+//   }
 
-//   console.log(`\n🎉 Done! Scraped ${visited.size} products`);
+//   console.log(`\n🎉 Done!`);
 //   console.log(`   Full data  → ${FULL_OUTPUT}`);
 //   console.log(`   Price data → ${PRICE_OUTPUT}`);
 // }
