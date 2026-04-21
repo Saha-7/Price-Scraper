@@ -35,6 +35,34 @@ const STORES = [
       // { slug: 'ram-memory',    url: 'https://mdcomputers.in/catalog/ram' },
     ],
   },
+  {
+    name: 'pickpcparts',
+    parser: require('./parsers/pickpcparts'),
+    categories: [
+      { slug: 'cpu-processor', url: 'https://pickpcparts.in/processors/' },
+     // { slug: 'motherboards',  url: '' },
+      { slug: 'ram-memory',    url: 'https://pickpcparts.in/rams/' },
+    //  { slug: 'graphic-cards', url: '' },
+    //  { slug: 'storages',      url: '' },
+    ],
+  },
+
+  // {
+  //   name: 'vedant',
+  //   parser: require('./parsers/vedant'),
+  //   categories: [
+  //     { slug: 'cpu-processor', url: 'https://www.vedantcomputers.com/...' },
+  //   ],
+  // },
+
+  // {
+  //   name: 'vedant',
+  //   parser: require('./parsers/vedant'),
+  //   categories: [
+  //     { slug: 'cpu-processor', url: 'https://www.vedantcomputers.com/...' },
+  //   ],
+  // },
+
   // {
   //   name: 'vedant',
   //   parser: require('./parsers/vedant'),
