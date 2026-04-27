@@ -1,3 +1,7 @@
+// ─────────────────────────────────────────────────────────────
+//  parsers/pickpcparts.js
+// ─────────────────────────────────────────────────────────────
+
 async function parseProductLinks(page) {
   return await page.evaluate(() => {
     const links = new Set();
@@ -35,17 +39,20 @@ async function parseProductDetails(page, url) {
     const category = urlParts[urlParts.length - 2] || null;
 
     // ── Retailer prices table ─────────────────────────────────
-    // table.pcpps-price-table has: Retailer | Price | Availability | Buy | Last Checked
+    // Columns: Retailer | Price | Availability | Buy | Last Checked
+    // FIX: skip rows where price is "—" (Amazon shows this when unlisted)
     const retailerPrices = [];
     document.querySelectorAll('table.pcpps-price-table tbody tr').forEach(row => {
       const cells = row.querySelectorAll('td');
       if (cells.length >= 4) {
-        const retailer   = cells[0]?.innerText?.trim();
-        const price      = cells[1]?.innerText?.trim();
-        const available  = cells[2]?.innerText?.trim();
-        const buyLink    = cells[3]?.querySelector('a')?.href || null;
+        const retailer    = cells[0]?.innerText?.trim();
+        const price       = cells[1]?.innerText?.trim();
+        const available   = cells[2]?.innerText?.trim();
+        const buyLink     = cells[3]?.querySelector('a')?.href || null;
         const lastChecked = cells[4]?.innerText?.trim() || null;
-        if (retailer && price) {
+
+        // Skip rows with no real price (e.g. Amazon shows "—" when unlisted)
+        if (retailer && price && price !== '—') {
           retailerPrices.push({ retailer, price, available, buyLink, lastChecked });
         }
       }
@@ -61,8 +68,8 @@ async function parseProductDetails(page, url) {
       : null;
 
     // ── Specifications ────────────────────────────────────────
-    // Elementor layout: label in one e-con, value in sibling e-con
-    // Pattern: parent container has 2 child containers — [label][value]
+    // Elementor layout: parent container has 2 child e-con containers
+    // left child = label (strong/p), right child = value (.elementor-widget-container)
     const specs = {};
     document.querySelectorAll('.e-con-full.e-flex.e-con.e-child').forEach(container => {
       const children = container.querySelectorAll(':scope > .e-con-full');
@@ -79,13 +86,22 @@ async function parseProductDetails(page, url) {
       }
     });
 
-    // ── Part IDs (can be multiple) ────────────────────────────
-    // From specs object
-    const partIds = specs['Part ID']
-      ? specs['Part ID'].split('\n').map(s => s.replace('•', '').trim()).filter(Boolean)
-      : [];
+    // ── Part IDs ──────────────────────────────────────────────
+    // FIX: Part ID uses <ul class="acf-list"> in the DOM, not plain text.
+    // Querying specs['Part ID'] gives a mangled newline-joined string.
+    // Read directly from the acf-list <li> elements instead.
+    const rawPartIds = [...document.querySelectorAll(
+      '.elementor-widget-container ul.acf-list li'
+    )].map(li => li.innerText.trim()).filter(Boolean);
+
+    const partId  = rawPartIds[0] || null;
+    const partId2 = rawPartIds[1] || undefined; // undefined = field won't appear in MongoDB doc
+
+    // FIX: remove the mangled Part ID entry from specs since we extract it separately
+    delete specs['Part ID'];
 
     // ── Price history from Chart.js script ────────────────────
+    // The chart data is inlined as: var data = { labels: [...], datasets: [...] }
     let priceHistory = null;
     document.querySelectorAll('script').forEach(script => {
       if (script.textContent.includes('pcpps_ph_')) {
@@ -106,18 +122,22 @@ async function parseProductDetails(page, url) {
     });
 
     // ── Amazon link ───────────────────────────────────────────
-    const amazonLink = document.querySelector('a[href*="amzn.to"], a[href*="amazon.in"]')?.href || null;
+    const amazonLink =
+      document.querySelector('a[href*="amzn.to"], a[href*="amazon.in"]')?.href || null;
 
     return {
-      url: pageUrl,
-      store: 'pickpcparts',
+      url:      pageUrl,
+      store:    'pickpcparts',
       name,
       category,
-      partIds,           // array — multiple Part IDs supported
-      retailerPrices,    // array of {retailer, price, available, buyLink, lastChecked}
-      lowestPrice: lowestPrice ? { retailer: lowestPrice.retailer, price: lowestPrice.price } : null,
-      specs,
-      priceHistory,      // full Chart.js data with labels + per-retailer history
+      partId,             // primary Part ID  e.g. "YD3200C5FHBOZ"
+      partId2,            // only present when a second Part ID exists (rare)
+      lowestPrice: lowestPrice
+        ? { retailer: lowestPrice.retailer, price: lowestPrice.price }
+        : null,
+      retailerPrices,     // array of { retailer, price, available, buyLink, lastChecked }
+      specs,              // all spec key-value pairs (Part ID removed — stored as partId/partId2)
+      priceHistory,       // { labels: [...dates], datasets: [{ retailer, data: [...prices] }] }
       amazonLink,
       scrapedAt: new Date().toISOString(),
     };
@@ -125,3 +145,11 @@ async function parseProductDetails(page, url) {
 }
 
 module.exports = { parseProductLinks, getNextPageUrl, parseProductDetails };
+
+
+
+
+
+// Normalise for SQL — always produces a flat string
+// const partIdForSQL = [doc.partId, doc.partId2].filter(Boolean).join(' / ');
+// → "100-100000457BOX"  or  "100-100000457BOX / 100-100000457MPK"
