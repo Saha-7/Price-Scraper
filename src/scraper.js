@@ -183,7 +183,7 @@ function getPaths(storeName, categorySlug) {
     urlsCache:    path.join(dir, 'collected_urls.json'),
     visitedCache: path.join(dir, 'visited.json'),
     fullOutput:   path.join(dir, 'products_full.json'),
-    priceOutput:  path.join(dir, 'products_prices.json'),
+    //priceOutput:  path.join(dir, 'products_prices.json'),
   };
 }
 
